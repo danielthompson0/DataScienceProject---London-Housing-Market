@@ -1,0 +1,692 @@
+---
+title: 'Data Science Project'
+author: "Daniel Thompson"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+      number_sections: true
+      highlight: haddock
+      theme: spacelab
+      toc: yes
+      toc_depth: 2
+      toc_float:
+        collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{=html}
+<style>
+div.navy1 { background-color:#686868; border-radius: 5px; padding: 20px; border-style: groove; color: #ffffff;}
+
+</style>
+```
+
+
+```{r, load_libraries, include = FALSE}
+
+if(!is.element("tidyverse", installed.packages()[,1]))
+{  install.packages("tidyverse", repos = "http://cran.us.r-project.org")}
+
+if(!is.element("Hmisc", installed.packages()[,1]))
+{  install.packages("Hmisc", repos = "http://cran.us.r-project.org")} #package for data summary using `describe`
+
+if(!is.element("ggplot2", installed.packages()[,1]))
+{  install.packages("ggplot2", repos = "http://cran.us.r-project.org")} #package for plots
+if(!is.element("ggthemes", installed.packages()[,1]))
+{  install.packages("ggthemes", repos = "http://cran.us.r-project.org")} #package to make fancier ggplots
+
+if(!is.element("janitor", installed.packages()[,1]))
+{ install.packages("janitor", repos = "http://cran.us.r-project.org")} #package to visualize results of machine learning tools
+if(!is.element("rpart.plot", installed.packages()[,1]))
+{  install.packages("rpart.plot", repos = "http://cran.us.r-project.org")} #package to visualize trees
+
+library(rpart.plot)
+library(caret)
+library(tidyverse) # the usual stuff: dplyr, readr, and other goodies
+library(lubridate)
+library(janitor) # clean_names()
+library(Hmisc)
+library(stats)
+library(glmnet)
+library(car)
+```
+
+# Introduction and learning objectives
+
+::: navy1
+<p>The goal of this project is to build a predictive model for guiding investment decisions in the London housing market. This involves constructing machine learning models to predict house prices and selecting the best 200 properties for investment purposes.</p>
+
+<ol type="i">
+
+<li>Applying various data mining algorithms for prediction.</li>
+
+<li>Handling and analyzing large datasets.</li>
+
+<li>Optimizing algorithms for enhanced performance.</li>
+
+<li>Interpreting results to understand the influence of different variables.</li>
+
+<li>Making informed business decisions based on algorithmic predictions.</li>
+
+</ol>
+:::
+
+# Load data
+
+There are two sets of data, i) training data that has the actual prices ii) out of sample data that has the asking prices. We begin by loading both data sets.
+
+```{r Read-investigate , message = FALSE, warning = FALSE}
+
+# Read the training and out-of-sample data.
+london_house_prices_2019_training <- read.csv("training_data_assignment_with_prices.csv")
+london_house_prices_2019_out_of_sample <- read.csv("test_data_assignment.csv")
+
+# Convert string dates to Date objects and convert character columns to factors for consistency in data types.
+london_house_prices_2019_training <- london_house_prices_2019_training %>% mutate(date = as.Date(date)) %>% mutate_if(is.character, as.factor)
+london_house_prices_2019_out_of_sample <- london_house_prices_2019_out_of_sample %>% mutate(date = as.Date(date)) %>% mutate_if(is.character, as.factor)
+
+# Quick examination of the structure of datasets.
+str(london_house_prices_2019_training)
+str(london_house_prices_2019_out_of_sample)
+
+# Check for missing values in both datasets.
+skimr::skim(london_house_prices_2019_training)
+skimr::skim(london_house_prices_2019_out_of_sample)
+
+# Remove columns with low completion rate to focus on more reliable data.
+london_house_prices_2019_training <- subset(london_house_prices_2019_training, select = -c(address2, town))
+london_house_prices_2019_out_of_sample <- subset(london_house_prices_2019_out_of_sample, select = -c(address2, town))
+
+# Filter out rows with missing population data to maintain data integrity.
+london_house_prices_2019_training <- london_house_prices_2019_training %>% filter(!is.na(population))
+london_house_prices_2019_out_of_sample <- london_house_prices_2019_out_of_sample %>% filter(!is.na(population))
+
+```
+
+```{r Split the price data to training and testing, message = FALSE, warning = FALSE}
+
+# Set seed for reproducibility 
+set.seed(123)
+
+# Loading the rsample package for data splitting
+library(rsample)
+
+# Splitting the data into training and testing sets with 75% of data for training
+train_test_split <- initial_split(london_house_prices_2019_training, prop = 0.75)
+train_data <- training(train_test_split)
+test_data <- testing(train_test_split)
+
+# Harmonizing 'postcode_short' levels across training and out-of-sample datasets
+common_postcode_levels <- union(levels(train_data$postcode_short), levels(london_house_prices_2019_out_of_sample$postcode_short))
+train_data$postcode_short <- factor(train_data$postcode_short, levels = common_postcode_levels)
+london_house_prices_2019_out_of_sample$postcode_short <- factor(london_house_prices_2019_out_of_sample$postcode_short, levels = common_postcode_levels)
+
+# Addressing high cardinality in 'nearest_station' variable across all datasets
+# Combining station data from all datasets for frequency analysis
+all_stations <- c(train_data$nearest_station, test_data$nearest_station, london_house_prices_2019_out_of_sample$nearest_station)
+
+# Creating a frequency table to identify rare stations
+station_freq <- table(all_stations)
+
+# Identifying stations with fewer than two occurrences
+rare_stations <- names(station_freq[station_freq < 2])
+
+# Replacing rare stations with 'Other' in each dataset
+train_data$nearest_station <- ifelse(train_data$nearest_station %in% rare_stations, 'Other', as.character(train_data$nearest_station))
+test_data$nearest_station <- ifelse(test_data$nearest_station %in% rare_stations, 'Other', as.character(test_data$nearest_station))
+london_house_prices_2019_out_of_sample$nearest_station <- ifelse(london_house_prices_2019_out_of_sample$nearest_station %in% rare_stations, 'Other', as.character(london_house_prices_2019_out_of_sample$nearest_station))
+
+# Ensuring consistency of 'nearest_station' levels across all datasets
+all_unique_stations <- unique(c(train_data$nearest_station, test_data$nearest_station, london_house_prices_2019_out_of_sample$nearest_station))
+train_data$nearest_station <- factor(train_data$nearest_station, levels = all_unique_stations)
+test_data$nearest_station <- factor(test_data$nearest_station, levels = all_unique_stations)
+london_house_prices_2019_out_of_sample$nearest_station <- factor(london_house_prices_2019_out_of_sample$nearest_station, levels = all_unique_stations)
+
+```
+
+# Visualize data
+
+Now we visualise and explore the data.
+
+```{r visualize , message = FALSE, warning = FALSE}
+# Histogram of house prices
+ggplot(data = london_house_prices_2019_training, aes(x = price)) +
+  geom_histogram(binwidth = 250000, fill = "lightblue", color = "black") +
+  labs(title = "Distribution of House Prices", x = "Price (GBP)", y = "Frequency") + 
+  theme_minimal()
+
+
+# Boxplot for house prices
+ggplot(london_house_prices_2019_training, aes(y = price)) +
+  geom_boxplot(fill = "lightblue", color = "black") +
+  labs(title = "Boxplot of House Prices", y = "Price (GBP)")+ 
+  theme_minimal()
+
+# Scatter plot for price vs distance to station
+ggplot(london_house_prices_2019_training, aes(x = distance_to_station, y = price)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method=lm)+
+  labs(title = "House Price vs Distance to Station", x = "Distance to Station (km)", y = "Price (GBP)")+ 
+  theme_minimal()+
+  scale_color_brewer(palette = "Set1")
+
+# Scatter plot for price vs total floor area
+ggplot(london_house_prices_2019_training, aes(x = total_floor_area, y = price)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method=lm)+
+  labs(title = "House Price vs Total Floor Area", x = "Total Floor Area", y = "Price (GBP")+ 
+  theme_minimal()+
+  scale_color_brewer(palette = "Set1")
+
+# Bar plot for property types
+ggplot(london_house_prices_2019_training, aes(x = property_type)) +
+  geom_bar(fill = "lightblue") +
+  labs(title = "Distribution of Property Types", x = "Property Type", y = "Count")+ 
+  theme_minimal()+
+  scale_color_brewer(palette = "Set1")
+
+# Time series plot of average house price over time
+london_house_prices_2019_training %>%
+  group_by(date) %>% 
+  summarise(avg_price=mean(price,na.rm=TRUE)) %>% 
+  ggplot(aes(x = date, y = avg_price)) +
+  geom_line(color = "steelblue") +
+  geom_smooth()+
+  labs(title = "Average House Price Over Time", x = "Date", y = "Average Price (GBP)")+ 
+  theme_minimal()+
+  scale_color_brewer(palette = "Set1")
+```
+
+Comments:
+
+From our first visualisation, we can see that the distribution of house prices is positively skewed, with most houses being prices between £250,000 and £750,000. The skew of this distribution indicates that there are a lot of outliers. To visualise the outliers, we create a boxplot. From the boxplot, we can see that there are indeed many outliers, with some houses holding incredibly high value.
+
+From these visualisations, we can make a decision on how we handle outliers. We decide to keep the outliers in this analysis since they are plentiful, and to ensure that the models make valid/reliable predictions on extreme values in the out of sample test.
+
+Now we begin to visualise whether any variables have correlation with the price of houses using a few scatter plots. From our House Price vs Distance to Station plot, we see a negative trend, indicating that as distance to station increases, we see a fall in the house prices, perhaps indicating that housing away from stations are less desirable. From our second scatter plot, we see that as total floor area increases, house prices also increases, but it also seems that so does variation. Perhaps, there is some interaction between floor space and another variable which causes the increase in variation.
+
+Then, we see which housing types are the most common. We see that Flats and Terraced houses are the most common property type in London. Finally, in our last plot we see the daily average house price over time. This plot confirms that there is a relatively steady trend during the period that we are analysing house prices. This already brings forth some uncertainty surrounding the robustness of the model in a more volatile housing market. The model should be stress tested before being used in these types of environments.
+
+Now we create a correlation table between prices and the other continuous variables.
+
+```{r, correlation table, warning=FALSE, message=FALSE}
+
+# produce a correlation table using GGally::ggcor()
+
+library("GGally")
+london_house_prices_2019_training %>% 
+  select(-ID) %>% #keep Y variable last
+  ggcorr(method = c("pairwise", "pearson"), layout.exp = 2,label_round=2, label = TRUE,label_size = 2,hjust = 1,nbreaks = 5,size = 2,angle = -20)
+
+```
+
+From the correlation table, we see that there are a few variables which we should explore. Firstly, despite having weak correlation with the price, we will explore how well num_tube_lines, average_income, and london_zone explain and help us predict house prices. Furthermore, we see that co2_emissions_potential, co2_emissions_current, and num_habitable_rooms have medium correlation, and total_floor_area has strong correlation with the house price. Although these variables should be explored, we should proceed with caution since there is colinearity between them.
+
+We also see that the most correlated variable is total_floor_area, with a correlation of 0.69. Since this variable is the most correlated, we will focus on this for feature engineering. For our models, I add an interaction variable between the total_floor_area and the postcode_short variables. My intuition for this is that the price of each square meter of floor area changes between postcodes, since some postcodes may inherently be more valuable, so this interaction variable may provide some information. Furthermore, I decide to add a polynomial term for total_floor_area, to account for any non-linear relationships between this and the price.
+
+# Further Preprocessing 
+
+Upon further inspection of the out of sample dataset, we see that we do not have access to all of the same variables that we have in the training data. These variables are: postcode, address1, address3, local_aut, county, and data. I decide to remove these from the training data.
+
+```{r Further Preprocessing , message = FALSE, warning = FALSE}
+
+# We remove these from the training data.
+train_data <- train_data %>%
+  select(
+    -postcode,
+    -address1,
+    -address3,
+    -local_aut,
+    -county,
+    -date
+  )
+
+#We remove these from the testing data.
+test_data <- test_data %>%
+  select(
+    -postcode,
+    -address1,
+    -address3,
+    -local_aut,
+    -county,
+    -date
+  )
+```
+
+# Fit a linear regression model
+
+I begin by building a linear model with the most significant features, as well as the interaction variable and polynomial variable previously discussed.
+
+```{r LR model , message = FALSE, warning = FALSE}
+
+# Setting a seed for reproducibility of results
+set.seed(123)
+
+# Defining control settings for cross-validation
+control <- trainControl(
+    method = "cv",        # Using cross-validation
+    number = 5,           # Number of folds in cross-validation
+    verboseIter = TRUE    # Output progress during training
+)
+
+# Training the linear regression model
+# Including interaction and polynomial terms for more nuanced model fitting
+model1_lm <- train(
+     price ~ freehold_or_leasehold + property_type + total_floor_area +
+     number_habitable_rooms + co2_emissions_potential + energy_consumption_potential + windows_energy_eff + longitude + london_zone + average_income + tenure + postcode_short + postcode_short:total_floor_area + poly(total_floor_area, 2),
+    data = train_data,
+    method = "lm",        # Specifying linear model
+    trControl = control   # Applying the control settings
+)
+
+# Limiting the max print output for a concise summary
+options(max.print = 20)
+# Displaying the summary of the trained model
+summary(model1_lm)
+
+```
+
+In the linear regression model, the inclusion of interaction terms and polynomial variables significantly enhances the model's ability to capture the complexities and nuances in the data, which are not always apparent through standard linear relationships.
+
+-   **Interaction Term (total_floor_area:postcode_short):** This interaction term helps to model the relationship between the total floor area of a property and its location (as indicated by the postcode). Since property values can vary greatly across different postcodes, even for similar-sized properties, this interaction term allows the model to capture these variations. It essentially allows the model to learn that the impact of floor area on price is not uniform across all locations but varies depending on where the property is situated.
+
+-   **Polynomial Term (poly(total_floor_area, 2)):** The inclusion of a polynomial term for total floor area addresses the possibility of a non-linear relationship between floor area and price. In many real estate markets, larger properties do not simply scale linearly in price with an increase in size. The polynomial term allows the model to capture such non-linear effects, such as diminishing returns on price with increasing size or other complex patterns that a linear term alone cannot capture.
+
+```{r , message = FALSE, warning = FALSE}
+
+# Calculating variable importance from the linear model
+importance <- varImp(model1_lm, scale = TRUE)
+
+# Sorting the importance scores in decreasing order
+sorted_importance <- importance$importance[order(-importance$importance$Overall),]
+
+# Selecting the top 15 most important variables
+top_15_importance <- head(sorted_importance, 20)
+
+# Plotting the importance of the top 15 variables
+plot(varImp(model1_lm, scale = TRUE), top = 15)
+
+```
+
+Upon inspection, the variable importance plot confirms the significance of the interaction variable.
+
+
+## Predict the values in testing and out of sample data
+
+Below I use the predict function to test the performance of the model in testing data and summarise the performance of the linear regression model. The quality of the predictions is then tested on the unseen testing dataset.
+
+```{r , message = FALSE, warning = FALSE}
+
+# Predicting house prices for the test dataset using the linear model
+lr_predictions <- predict(model1_lm, test_data)
+
+# Calculating RMSE (Root Mean Square Error) and R-squared for the test predictions
+# RMSE measures the average error between predicted and actual values
+# R-squared indicates the proportion of variance explained by the model
+lr_results <- data.frame(
+  RMSE = RMSE(lr_predictions, test_data$price), 
+  Rsquare = R2(lr_predictions, test_data$price)
+)
+
+# Displaying the performance metrics
+lr_results
+
+# Predicting house prices for out-of-sample data
+# This step applies the trained model to new, unseen data
+predictions_oos <- predict(model1_lm, london_house_prices_2019_out_of_sample)
+
+
+```
+
+Achieving an R-squared of 84.1% in the linear regression model is a significant achievement for my project. This high level of explained variance indicates that the model is effectively capturing the key factors that influence London's house prices. It gives me confidence in the model's ability to make accurate predictions, which is crucial for guiding investment decisions in the property market. This result reinforces the value of the chosen variables and the model's approach, suggesting that it can be a reliable tool for understanding and predicting house price trends in London. As I move forward, this robust R-squared value serves as a strong foundation, confirming the model's potential in practical applications.
+
+# Fit a tree model
+
+In developing the tree model, I focused on identifying key variables that significantly impact house prices. Using the `rpart` library, I first created a basic decision tree with 'price' as the target. Then, I determined the most influential features from the dataset, zeroing in on the top 20. These included variables like 'total_floor_area', 'nearest_station', and 'postcode_short'. By incorporating these significant factors, along with interaction terms and polynomial elements, the model was designed to capture a comprehensive picture of the housing market.
+
+```{r tree model , message = FALSE, warning = FALSE}
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Load necessary library for decision trees
+library(rpart)
+
+# Define the target variable
+target_variable <- "price"
+
+# Fit a decision tree model to the training data
+# The formula specifies the target variable and all other variables as predictors
+simple_tree_model <- rpart(formula = paste(target_variable, "~ ."), data = train_data)
+
+# Extracting variable importance from the decision tree model
+var_importance <- simple_tree_model$variable.importance
+
+# Selecting the top 20 most important variables
+top_n_features <- 20
+top_features <- sort(var_importance, decreasing = TRUE)[1:top_n_features]
+print(names(top_features))
+
+# Training a refined tree model with selected features
+model2_tree <- train(
+   price ~ total_floor_area + nearest_station + postcode_short + district + 
+             number_habitable_rooms + london_zone + co2_emissions_current + 
+             co2_emissions_potential + num_tube_lines + property_type + 
+             freehold_or_leasehold + longitude + average_income + altitude + 
+             latitude + windows_energy_eff + total_floor_area:postcode_short + poly(total_floor_area, 2),
+  data = train_data,
+  method = "rpart",
+  trControl = control,
+  tuneLength = 10
+)
+
+# Viewing model performance metrics
+print(model2_tree$results)
+
+# Visualizing the decision tree
+rpart.plot(model2_tree$finalModel)
+
+# Visualizing variable importance of the refined tree model
+importance <- varImp(model2_tree, scale = TRUE)
+print(importance)
+
+# Plotting the top 20 most important variables
+plot(importance, top = 20)
+
+```
+
+
+Now lets see how well the decision tree model performs on the testing data. 
+
+```{r , message = FALSE, warning = FALSE}
+
+# Predicting house prices on the test data using the decision tree model
+predictions_tree <- predict(model2_tree, test_data)
+
+# Creating a data frame to store the performance metrics of the decision tree model
+# RMSE (Root Mean Squared Error) measures the average magnitude of the prediction errors
+# R-square (Coefficient of Determination) measures the proportion of variance in the dependent variable that is predictable from the independent variables
+tr_results <- data.frame(
+  RMSE = RMSE(predictions_tree, test_data$price), 
+  Rsquare = R2(predictions_tree, test_data$price)
+)
+
+# Displaying the performance metrics
+print(tr_results)
+
+ 
+```
+
+However, when comparing its performance to the linear regression model, the tree model lagged behind. It achieved an R-squared of 62.3%, which was lower than the linear model's 84.1%. This difference suggests that the linear model was more adept at interpreting the data, possibly due to its strength in handling linear correlations. The tree model, while insightful, might have struggled with the complexity of the data, highlighting the need for careful model selection based on the data's characteristics and the project's goals.
+
+# Other algorithms
+
+## XGBoost
+
+XGBoost, or Extreme Gradient Boosting, is a sophisticated machine learning algorithm renowned for its efficiency, flexibility, and high performance, particularly in structured data scenarios like ours. It's part of a class of ensemble methods known as boosting, where models are built sequentially, and each model attempts to correct the errors of its predecessor. XGBoost stands out for its ability to handle a wide range of data types, its robustness to overfitting, and its capability to efficiently manage missing data and high-dimensional spaces.
+
+
+```{r XG Boost , message = FALSE, warning = FALSE}
+# Setting a seed for reproducibility
+set.seed(123)
+
+# Loading necessary libraries
+library(caret)
+library(xgboost)
+
+# Converting factor variables to numeric in the training and test datasets
+train_data_xgb <- train_data %>% mutate_if(is.factor, as.numeric)
+test_data_xgb <- test_data %>% mutate_if(is.factor, as.numeric)
+
+# Defining training control parameters for cross-validation
+train_control <- trainControl(method = "cv", number = 5, verboseIter = TRUE)
+
+# Creating a tuning grid to specify the hyperparameters for XGBoost
+tune_grid <- expand.grid(
+  nrounds = 3000,                  # Number of boosting rounds
+  max_depth = c(5),                # Maximum depth of a tree
+  eta = c(0.05),                   # Learning rate
+  gamma = c(0.2),                  # Minimum loss reduction for partition
+  colsample_bytree = c(0.7),       # Subsample ratio of columns per tree
+  min_child_weight = c(3),         # Minimum sum of instance weight needed in a child
+  subsample = c(0.8)               # Subsample ratio of the training instances
+)
+
+# Training the XGBoost model with the defined parameters
+xgb_model <- train(
+  price ~ . + total_floor_area:postcode_short + poly(total_floor_area, 2),
+  data = train_data_xgb,
+  method = "xgbTree",
+  trControl = train_control,
+  tuneGrid = tune_grid
+)
+
+# Generating predictions on test data and evaluating performance
+xgb_predictions <- predict(xgb_model, test_data_xgb)
+xgb_results <- data.frame(
+  RMSE = RMSE(xgb_predictions, test_data$price), 
+  Rsquare = R2(xgb_predictions, test_data$price)
+)
+
+# Displaying the performance metrics
+print(xgb_results)
+
+
+```
+
+In this project, I chose XGBoost due to its proven track record in accurately predicting outcomes in complex datasets like the London housing market. The algorithm's fine-tuning capabilities, through parameters like maximum depth and learning rate, allowed me to tailor the model specifically to our data's nuances. The model was finetuned through trial and error. Achieving an impressive R-squared of approximately 86.8%, XGBoost has demonstrated its robustness and accuracy in forecasting house prices. This level of performance instills confidence in the model's predictions, making it an invaluable tool for identifying profitable investment opportunities in the market.
+
+Moving forward, I plan to compare the XGBoost model's insights with those from a ridge regression model, another powerful technique in predictive modeling. By evaluating these models side by side, I can ensure the most comprehensive analysis of the housing market, leading to more informed and effective investment decisions.
+
+## Ridge Regression
+
+Ridge regression, a technique particularly effective for models with a large number of predictor variables, plays a crucial role in this project. By introducing a penalty term (lambda) to the cost function, ridge regression minimizes the impact of less significant variables, thus tackling multicollinearity and overfitting issues that are common in high-dimensional data like ours. In our case, setting alpha to 0 specifically designates the model as a ridge regression, focusing solely on L2 regularization.
+
+
+```{r Ridge Regression , message = FALSE, warning = FALSE}
+# Load necessary libraries
+library(caret)
+library(glmnet)
+
+# Set training control parameters
+# Reduced the number of cross-validation folds from 10 to 5 for efficiency
+train_control <- trainControl(method = "cv", number = 5, verboseIter = TRUE)
+
+# Define a tuning grid focusing on Ridge Regression parameters
+# Alpha set to 0 signifies a Ridge Regression
+tune_grid <- expand.grid(
+  alpha = 0,          # Ridge Regression
+  lambda = 10000      # Regularization strength
+)
+
+# Train the Ridge Regression model
+# Including interaction between total_floor_area and postcode_short
+# and a polynomial term for total_floor_area to capture non-linear effects
+ridge_model <- train(
+  price ~ . + total_floor_area:postcode_short + poly(total_floor_area, 2),
+  data = train_data,
+  method = "glmnet",
+  trControl = train_control,
+  tuneGrid = tune_grid
+)
+
+# Predicting and evaluating the model on the test data
+# Calculating RMSE and R-squared metrics
+ridge_predictions <- predict(ridge_model, newdata = test_data)
+ridge_results <- data.frame(
+  RMSE = RMSE(ridge_predictions, test_data$price), 
+  Rsquare = R2(ridge_predictions, test_data$price)
+)
+
+# Displaying the results
+print(ridge_results)
+
+```
+
+The choice of ridge regression for this project, yielding an R-squared of approximately 85.5%, was strategic. The use of alpha = 0 (ridge regression) over a mixed elastic net approach was found to be more effective, likely due to its simplicity and direct approach in shrinking coefficients, hence enhancing model performance. This decision underscores the importance of model selection tailored to the specific characteristics of the data. In our context, with the goal of predicting London housing prices accurately, ridge regression provides a balance between complexity and predictability, ensuring robust predictions without overfitting the training data.
+
+## Random Forest Regression
+
+Following the development of a tree model, the next step in our predictive journey is the implementation of a random forest regression. Random forest, an ensemble learning method, builds upon the concept of decision trees. It creates a 'forest' of trees where each tree is trained on a random subset of the data, and the final output is determined by averaging the predictions from all trees. This approach inherently reduces the variance, preventing the overfitting issues often seen in individual tree models.
+
+In our analysis, dealing with the high cardinality of variables like 'nearest_station' posed a significant challenge. While such features could add depth to the model, they also complicate it, potentially leading to diminished returns in terms of performance. Consequently, I decided to exclude 'nearest_station' from the random forest model. This decision was made to maintain a balance between model complexity and interpretability. On the other hand, retaining 'postcode_short' proved beneficial as it significantly contributed to a higher R-squared, indicating its importance in predicting house prices. This strategic choice highlights the importance of feature selection in model building, especially in methods like random forests where the trade-off between complexity and performance is crucial.
+
+```{r Random Forest, message = FALSE, warning = FALSE}
+# Load necessary libraries
+library(caret)
+library(ranger)
+
+# Preprocess the training data by removing 'nearest_station' to reduce cardinality
+train_data_rf <- train_data %>% select(-nearest_station)
+
+# Apply the same preprocessing to the test data
+test_data_rf <- test_data %>% select(-nearest_station)
+
+# Define training control parameters
+# Using 5-fold cross-validation for model validation
+train_control <- trainControl(method = "cv", number = 5, verboseIter = TRUE)
+
+# Define a tuning grid focusing on key Random Forest parameters
+tune_grid <- expand.grid(
+  mtry = 21,             # Number of variables randomly sampled as candidates at each split
+  splitrule = "variance", # Criteria for splitting nodes
+  min.node.size = 5      # Minimum size of terminal nodes
+)
+
+# Train the Random Forest model using the 'ranger' package
+# The model includes interaction and polynomial terms to capture complex relationships
+rf_model <- train(
+  price ~ . + postcode_short:total_floor_area + poly(total_floor_area, 2),
+  data = train_data_rf,
+  method = "ranger",
+  trControl = train_control,
+  tuneGrid = tune_grid,
+  num.trees = 1000       # Number of trees to grow in the forest
+)
+
+# Predict and evaluate the model on test data
+# Calculating RMSE and R-squared metrics
+rf_predictions <- predict(rf_model, test_data_rf)
+rf_results <- data.frame(
+  RMSE = RMSE(rf_predictions, test_data$price), 
+  Rsquare = R2(rf_predictions, test_data$price)
+)
+
+# Displaying the results
+print(rf_results)
+
+
+```
+
+The Random Forest model, achieving an R-squared of approximately 85.4%, demonstrates superior performance compared to the basic tree model. This improvement is attributed to Random Forest's ability to average multiple decision tree outputs, reducing variance and avoiding overfitting. This enhanced accuracy is crucial for reliable real estate investment decisions in our project. Moreover, the integration of caret and ranger in R effectively manages interaction terms and categorical variables, allowing for a more nuanced and accurate representation of the complex factors influencing London's housing market.
+
+# Stacking
+
+The stacking method combines the predictive power of multiple algorithms, providing a nuanced understanding of the data. By leveraging the strengths of individual models like XGBoost, Random Forest, Ridge Regression, and Linear Regression, this approach captures a broader range of data patterns and relationships. Stacking in this context is more than just an ensemble technique; it's a strategic move to enhance the robustness and accuracy of predictions, vital for making informed investment decisions in the dynamic London housing market.
+
+```{r Stacking, message = FALSE, warning = FALSE}
+# Load necessary library for glmnet
+library(glmnet)
+
+# Generate Predictions for Training Data from each base model
+xgb_train_pred <- predict(xgb_model, train_data_xgb)
+rf_train_pred <- predict(rf_model, train_data_rf)
+ridge_train_pred <- predict(ridge_model, train_data)
+lm_train_pred <- predict(model1_lm, train_data)
+
+# Combine Predictions for Training Data into a data frame
+combined_train_pred <- data.frame(xgb = xgb_train_pred, rf = rf_train_pred, ridge = ridge_train_pred, lm = lm_train_pred)
+
+# Convert combined predictions to matrix format for glmnet
+combined_train_pred_matrix <- as.matrix(combined_train_pred)
+
+# Train the Elastic Net Meta-Model using glmnet
+# alpha = 0.5 for equal weight to L1 and L2 regularization. Adjust as necessary.
+ridge_model_meta <- cv.glmnet(combined_train_pred_matrix, train_data$price, alpha = 0)
+
+# Find the best lambda value
+best_lambda <- ridge_model_meta$lambda.min
+
+# Prepare test data for prediction
+xgb_test_pred <- predict(xgb_model, test_data_xgb)
+rf_test_pred <- predict(rf_model, test_data_rf)
+ridge_test_pred <- predict(ridge_model, test_data)
+lm_test_pred <- predict(model1_lm, test_data)
+
+combined_test_pred_matrix <- as.matrix(data.frame(xgb = xgb_test_pred, rf = rf_test_pred, ridge = ridge_test_pred, lm = lm_test_pred))
+
+# Make final predictions using the Elastic Net Meta-Model with the best lambda value
+final_predictions_elastic <- predict(ridge_model_meta, newx = combined_test_pred_matrix, s = best_lambda)
+
+# Evaluate the Performance by calculating RMSE and R-squared
+stacked_results_elastic <- postResample(pred = final_predictions_elastic, obs = test_data$price)
+stacked_results_elastic
+
+# Display a summary of the Elastic Net Meta-Model
+summary(ridge_model_meta)
+
+
+```
+
+The final R-squared value of around 88.4% achieved through stacking signifies a high degree of accuracy in predicting house prices, reflecting the effectiveness of combining multiple models. This enhanced predictive capability is crucial in navigating the complexities of the real estate market, ensuring that investment decisions are grounded in comprehensive data analysis.
+
+# Pick investments
+
+Selecting the top 200 properties for investment is the culmination of this extensive data science endeavor. The chosen algorithm's predictions guide the identification of properties with the highest potential for profit. This step is not just about applying a model; it's about translating complex data insights into actionable investment strategies. By meticulously analyzing the estimated profits and market dynamics, this process exemplifies the practical application of data science in real-world decision-making.
+
+```{r Pick Investments, EVAL=FALSE}
+# Load necessary libraries
+library(dplyr)
+library(glmnet)
+
+# Assuming 'oos' is your out-of-sample dataset
+numchoose <- 200
+oos <- london_house_prices_2019_out_of_sample
+
+# Prepare data for XGBoost and Random Forest models
+oos_xgb <- oos %>% mutate_if(is.factor, as.numeric)
+oos_rf <- oos %>% select(-nearest_station) 
+
+# Generate Predictions for Out-of-Sample Data
+lm_oos_pred <- predict(model1_lm, oos)
+xgb_oos_pred <- predict(xgb_model, oos_xgb)
+ridge_oos_pred <- predict(ridge_model, oos)
+rf_oos_pred <- predict(rf_model, oos_rf)
+
+# Combine individual predictions into a matrix
+combined_oos_predictions <- as.matrix(data.frame(
+  lm = lm_oos_pred,
+  xgb = xgb_oos_pred,
+  ridge = ridge_oos_pred,
+  rf = rf_oos_pred
+))
+
+# Use the stacked Ridge Regression model to make final predictions
+predicted_price <- predict(ridge_model_meta, newx = combined_oos_predictions, s = best_lambda)
+
+# Calculate estimated profit for each property
+estimated_profit <- (predicted_price - oos$asking_price) / oos$asking_price
+
+# Create a temporary dataframe for sorting and selecting top 200 investments
+temp_df <- oos
+temp_df$estimated_profit <- estimated_profit
+
+# Select the IDs of the top 200 investments
+top_200_ids <- temp_df %>% 
+  arrange(desc(estimated_profit)) %>% 
+  head(numchoose) %>% 
+  pull(ID)
+
+# Add a 'buy' column to the original 'oos' dataframe
+oos$buy <- ifelse(oos$ID %in% top_200_ids, 1, 0)
+
+# Write the modified 'oos' dataframe to a CSV file
+write.csv(oos, "Thompson_Daniel.csv", row.names = FALSE)
+
+```
+
+Concluding this project, the journey from data exploration to investment selection demonstrates the transformative power of data science in the real estate domain. The insights gained and the methodology applied here underscore the importance of rigorous data analysis in guiding strategic investment decisions.
+
