@@ -1,4 +1,4 @@
-# London Housing Market Data Science Project
+# Predicting London Housing Prices Using Machine Learning Methods
 
 ## Overview
 This repository showcases my data science project focused on predicting housing prices in London for optimal investment opportunities. Using various data science techniques, the project aims to analyze the housing market, identify key trends, and develop predictive models for housing prices.
